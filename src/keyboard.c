@@ -2,6 +2,8 @@
 
 #include <string.h>
 
+#define MAX_KEYPRESSES 6
+
 static bool g_isUsbOperationMode;
 
 static struct
@@ -13,30 +15,30 @@ static struct
 	struct port_config row_disable_config;
 } g_keyPinConsts;
 
+struct kbd_keypress_info
+{
+	uint8_t modifier_code;
+	uint8_t multimedia_code;
+	uint8_t keypress_array[MAX_KEYPRESSES];
+	uint8_t num_keypresses;
+};
+
 static volatile bool g_enableKeyboard = false;
 static volatile bool g_enableMultimedia = false;
 
-static struct i2c_slave_module g_I2CPeripheralInstance;
-
-#define MAX_KEYPRESSES 6
-
-#define I2C_DATA_LEN 8
-
-static uint8_t g_I2CData1[I2C_DATA_LEN];
-static uint8_t g_I2CData2[I2C_DATA_LEN];
-
-static uint8_t *g_I2CDataProduce = g_I2CData1;
-static uint8_t *g_I2CDataTransmit = g_I2CData2;
-
-static volatile int8_t g_encoderEvent = -1;
-
-static struct i2c_slave_packet g_I2CPacket;
+static volatile struct
+{
+	bool last_pin_a;
+	int8_t pressed;
+	int8_t event;
+} g_encoderState = { true, -1, -1 };
 
 struct adc_module g_adcInstance;
 static uint16_t g_adcResult;
 static volatile bool g_adcReadDone = false;
 
-static struct tc_module g_tcInstance;
+static struct tc_module g_tcKbdInstance;
+static struct tc_module g_tcEncInstance;
 
 static struct dac_module g_dacInstance;
 
@@ -50,10 +52,9 @@ void configure_pins(void)
 	}
 
 	// Fill config data for rows that are disabled (not currently being read)
-	// These rows are set as input with no pull up/down, so the signal is tri-stated
+	// These rows are tri-stated
 	port_get_config_defaults(&g_keyPinConsts.row_disable_config);
-	g_keyPinConsts.row_disable_config.direction = PORT_PIN_DIR_INPUT;
-	g_keyPinConsts.row_disable_config.input_pull = PORT_PIN_PULL_NONE;
+	g_keyPinConsts.row_disable_config.powersave = true;
 	port_group_set_config(&PORTA, g_keyPinConsts.row_mask, &g_keyPinConsts.row_disable_config);
 
 	// Fill config data for the actively-read row
@@ -75,12 +76,12 @@ void configure_pins(void)
 	colconfig.input_pull = PORT_PIN_PULL_UP;
 	port_group_set_config(&PORTA, g_keyPinConsts.col_mask, &colconfig);
 	
-	// Set rotary encoder pin B as input w/ pullup (A handled by extint)
+	// Set rotary encoder pins as input w/ pullup
 	struct port_config encconfig;
 	port_get_config_defaults(&encconfig);
 	encconfig.direction = PORT_PIN_DIR_INPUT;
 	encconfig.input_pull = PORT_PIN_PULL_UP;
-	port_group_set_config(&PORTA, 1 << PIN_KBD_ENC_B, &encconfig);
+	port_group_set_config(&PORTA, (1 << PIN_KBD_ENC_A) | (1 << PIN_KBD_ENC_B), &encconfig);
 }
 
 void configure_adc(void)
@@ -103,6 +104,12 @@ void configure_adc(void)
 	adc_enable_callback(&g_adcInstance, ADC_CALLBACK_READ_BUFFER);
 }
 
+void configure_i2c(void)
+{
+	i2c_kbd_data_register_callback(i2c_data_callback);
+	i2c_kbd_data_enable_callback();
+}
+
 void configure_tc(void)
 {
 	struct tc_config timerconfig;
@@ -114,53 +121,31 @@ void configure_tc(void)
 	timerconfig.counter_8_bit.period = 125;
 	timerconfig.counter_8_bit.compare_capture_channel[0] = 100;
 		
-	tc_init(&g_tcInstance, TC3, &timerconfig);
-	tc_enable(&g_tcInstance);
+	tc_init(&g_tcKbdInstance, TC3, &timerconfig);
+	tc_enable(&g_tcKbdInstance);
 		
-	tc_register_callback(&g_tcInstance, keyboard_scan_tc_callback, TC_CALLBACK_CC_CHANNEL0);
-	tc_enable_callback(&g_tcInstance, TC_CALLBACK_CC_CHANNEL0);
+	tc_register_callback(&g_tcKbdInstance, keyboard_scan_tc_callback, TC_CALLBACK_CC_CHANNEL0);
+	tc_enable_callback(&g_tcKbdInstance, TC_CALLBACK_CC_CHANNEL0);
+
+	struct tc_config encconfig;
+	tc_get_config_defaults(&encconfig);
+		
+	encconfig.counter_size = TC_COUNTER_SIZE_8BIT;
+	encconfig.clock_source = GCLK_GENERATOR_3;
+	encconfig.clock_prescaler = TC_CLOCK_PRESCALER_DIV16;
+	encconfig.counter_8_bit.period = 250;
+	encconfig.counter_8_bit.compare_capture_channel[0] = 33;
+		
+	tc_init(&g_tcEncInstance, TC4, &encconfig);
+	tc_enable(&g_tcEncInstance);
+		
+	tc_register_callback(&g_tcEncInstance, rot_enc_scan_tc_callback, TC_CALLBACK_CC_CHANNEL0);
+	tc_enable_callback(&g_tcEncInstance, TC_CALLBACK_CC_CHANNEL0);
 }
 
 void configure_usb_hid(void)
 {
 	udc_start();
-}
-
-void configure_extint(void)
-{
-	struct extint_chan_conf intconfig;
-	extint_chan_get_config_defaults(&intconfig);
-
-	intconfig.gpio_pin = EXTINT_KBD_ENC_A;
-	intconfig.gpio_pin_mux = MUX_KBD_ENC_A;
-	intconfig.filter_input_signal = true;
-	intconfig.detection_criteria = EXTINT_DETECT_FALLING;
-	intconfig.gpio_pin_pull = EXTINT_PULL_UP;
-	
-	extint_chan_set_config(CHAN_KBD_ENC_A, &intconfig);
-	
-	extint_register_callback(rot_enc_extint_callback, CHAN_KBD_ENC_A, EXTINT_CALLBACK_TYPE_DETECT);
-	extint_chan_enable_callback(CHAN_KBD_ENC_A, EXTINT_CALLBACK_TYPE_DETECT);
-}
-
-void configure_i2c_peripheral(void)
-{
-	struct i2c_slave_config i2cconfig;
-	i2c_slave_get_config_defaults(&i2cconfig);
-
-	i2cconfig.address = KBD_I2C_PERIPHERAL_ADDR;
-	i2cconfig.address_mode = I2C_SLAVE_ADDRESS_MODE_MASK;
-	
-	i2cconfig.generator_source = GCLK_GENERATOR_3;
-	
-	i2c_slave_init(&g_I2CPeripheralInstance, KBD_I2C_SERCOM_IFACE, &i2cconfig);
-	i2c_slave_enable(&g_I2CPeripheralInstance);
-
-	i2c_slave_register_callback(&g_I2CPeripheralInstance, i2c_read_request_callback, I2C_SLAVE_CALLBACK_READ_REQUEST);
-	i2c_slave_enable_callback(&g_I2CPeripheralInstance, I2C_SLAVE_CALLBACK_READ_REQUEST);
-
-	// i2c_slave_register_callback(&g_I2CPeripheralInstance, i2c_write_request_callback, I2C_SLAVE_CALLBACK_WRITE_REQUEST);
-	// i2c_slave_enable_callback(&g_I2CPeripheralInstance, I2C_SLAVE_CALLBACK_WRITE_REQUEST);
 }
 
 void configure_dac(void)
@@ -187,14 +172,6 @@ void disable_adc(void)
 {
 	adc_disable(&g_adcInstance);
 }
-
-static struct kbd_keypress_info
-{
-	uint8_t modifier_code;
-	uint8_t multimedia_code;
-	uint8_t keypress_array[MAX_KEYPRESSES];
-	uint8_t num_keypresses;
-};
 
 static inline void handle_keypress(uint16_t key_id, struct kbd_keypress_info* keyinfo)
 {
@@ -239,12 +216,12 @@ void keyboard_scan_tc_callback(struct tc_module *const module)
 	struct kbd_keypress_info keyinfo;
 	memset(&keyinfo, 0, sizeof(struct kbd_keypress_info));
 
-	const int8_t encevt = g_encoderEvent;
+	const int8_t encevt = g_encoderState.event;
 	if (encevt >= 0)
 	{
 		handle_keypress(ENCMAP[encevt], &keyinfo);
 		
-		g_encoderEvent = -1;
+		g_encoderState.event = -1;
 	}
 
 	for (unsigned r = 0; r < NUM_ROWS; r++)
@@ -283,34 +260,38 @@ void keyboard_scan_tc_callback(struct tc_module *const module)
 	}
 	else
 	{
-		system_interrupt_enter_critical_section();
-		memcpy(g_I2CDataProduce, &keyinfo, MAX_KEYPRESSES);
-		system_interrupt_leave_critical_section();
+		set_i2c_kbd_data((uint8_t *) &keyinfo);
 	}
 
 	UNUSED(module);
 }
 
-void rot_enc_extint_callback(void)
+void rot_enc_scan_tc_callback(struct tc_module *const module)
 {
-	uint8_t enc_input = port_group_get_input_level(&PORTA, 1 << PIN_KBD_ENC_B);
-	g_encoderEvent = enc_input == 0 ? 1 : 0;
-}
+	uint8_t enc_input = port_group_get_input_level(&PORTA, (1 << PIN_KBD_ENC_A) | (1 << PIN_KBD_ENC_B));
 
-void i2c_read_request_callback(struct i2c_slave_module *const module)
-{
-	system_interrupt_enter_critical_section();
-	
-	uint8_t *tmp = g_I2CDataProduce;
-	g_I2CDataProduce = g_I2CDataTransmit;
-	g_I2CDataTransmit = tmp;
+	bool enc_a = (enc_input & (1 << PIN_KBD_ENC_A)) == 0;
+	bool enc_b = (enc_input & (1 << PIN_KBD_ENC_B)) == 0;
 
-	g_I2CPacket.data_length = I2C_DATA_LEN;
-	g_I2CPacket.data = g_I2CDataTransmit;
+	if (enc_a != g_encoderState.last_pin_a)
+	{
+		if (enc_a)
+		{
+			g_encoderState.pressed = enc_b;
+		}
+		else 
+		{
+			if (g_encoderState.pressed != enc_b)
+			{
+				g_encoderState.event = g_encoderState.pressed;
+			}
+			g_encoderState.pressed = -1;
+		}
 
-	system_interrupt_leave_critical_section();
+		g_encoderState.last_pin_a = enc_a;
+	}
 
-	i2c_slave_write_packet_job(module, &g_I2CPacket);
+	UNUSED(module);
 }
 
 
@@ -335,6 +316,17 @@ bool hid_multimedia_enable_callback(void)
 void hid_multimedia_disable_callback(void)
 {
 	g_enableMultimedia = false;
+}
+
+
+void i2c_data_callback(uint8_t address, uint8_t value)
+{
+	switch (address)
+	{
+		case KBD_I2C_REG_BACKLIGHT:
+			dac_chan_write(&g_dacInstance, PIN_KBD_LED_CHAN, value << 2);
+			break;
+	}
 }
 
 

@@ -801,6 +801,12 @@
     <Compile Include="src\ASF\sam0\drivers\usb\stack_interface\usb_dual.c">
       <SubType>compile</SubType>
     </Compile>
+    <Compile Include="src\keyboard_i2c.c">
+      <SubType>compile</SubType>
+    </Compile>
+    <Compile Include="src\keyboard_i2c.h">
+      <SubType>compile</SubType>
+    </Compile>
     <Compile Include="src\udi_hid_desc.c">
       <SubType>compile</SubType>
     </Compile>

@@ -30,8 +30,8 @@
 #define HID_MULTIMEDIA_KEY_SCAN_NEXT     0x02
 #define HID_MULTIMEDIA_KEY_PLAY_PAUSE    0x04
 #define HID_MULTIMEDIA_KEY_MUTE          0x10
-#define HID_MULTIMEDIA_KEY_VOLUME_DOWN   0x60
 #define HID_MULTIMEDIA_KEY_VOLUME_UP     0x20
+#define HID_MULTIMEDIA_KEY_VOLUME_DOWN   0x40
 
 extern UDC_DESC_STORAGE udi_api_t udi_api_hid_multimedia;
 
@@ -45,7 +45,7 @@ typedef struct {
 
 //! Report descriptor for HID keyboard
 typedef struct {
-	uint8_t array[65];
+	uint8_t array[63];
 } udi_hid_multimedia_report_desc_t;
 
 

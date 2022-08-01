@@ -26,7 +26,6 @@ int main (void)
 	}
 	
 	configure_tc();
-	configure_extint();
 	configure_dac();
 	
 	while (1)
